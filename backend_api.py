@@ -1,39 +1,42 @@
 """
-DEEPFAKE DETECTION BACKEND - PRODUCTION VERSION
-================================================
-This runs on Render.com in the cloud.
-Everyone's phone connects to this — no need to keep your computer on!
+DEEPFAKE DETECTION BACKEND - MEMORY OPTIMIZED
 """
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
-import os
 import tempfile
-import base64
 
 app = Flask(__name__)
 CORS(app)
 
-# ============================================
-# LOAD MODEL
-# The model file must be in the same folder
-# as this file when deployed
-# ============================================
+# Load model ONCE at startup
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'deepfake_detector_final.h5')
-
-print("Loading deepfake detection model...")
 model = None
-try:
-    from tensorflow.keras.models import load_model
-    model = load_model(MODEL_PATH)
-    print("Model loaded successfully!")
-except Exception as e:
-    print(f"Model loading error: {e}")
+
+def get_model():
+    global model
+    if model is None:
+        import tensorflow as tf
+        tf.config.set_visible_devices([], 'GPU')
+        from tensorflow.keras.models import load_model
+        model = load_model(MODEL_PATH, compile=False)
+        print("Model loaded!")
+    return model
+
+# Load at startup
+print("Loading model at startup...")
+get_model()
+print("Ready!")
 
 
-def extract_frames(video_path, num_frames=30, target_size=(224, 224)):
+def extract_frames(video_path, num_frames=15, target_size=(224, 224)):
+    """Extract fewer frames to save memory."""
     cap = cv2.VideoCapture(video_path)
     frames = []
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -49,34 +52,28 @@ def extract_frames(video_path, num_frames=30, target_size=(224, 224)):
         ret, frame = cap.read()
         if ret:
             frame = cv2.resize(frame, target_size)
-            frame = frame / 255.0
+            frame = (frame / 255.0).astype(np.float32)
             frames.append(frame)
 
     cap.release()
 
     while len(frames) < num_frames:
-        frames.append(np.zeros((target_size[0], target_size[1], 3)))
+        frames.append(np.zeros((target_size[0], target_size[1], 3), dtype=np.float32))
 
-    return np.array(frames)
+    return np.array(frames, dtype=np.float32)
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if model is None:
-        return jsonify({'error': 'Model not loaded on server'}), 500
-
     if 'video' not in request.files:
         return jsonify({'error': 'No video file received'}), 400
 
     video_file = request.files['video']
-
-    # Save to temp file
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, 'upload.mp4')
     video_file.save(temp_path)
 
     try:
-        # Get video info
         cap = cv2.VideoCapture(temp_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -85,14 +82,17 @@ def predict():
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
 
-        # Extract and predict
         frames = extract_frames(temp_path)
         if frames is None:
             return jsonify({'error': 'Could not read video frames'}), 400
 
+        m = get_model()
         frames_input = np.expand_dims(frames, axis=0)
-        prediction = model.predict(frames_input, verbose=0)
+        prediction = m.predict(frames_input, verbose=0, batch_size=1)
         probability = float(prediction[0][0])
+
+        # Free memory
+        del frames, frames_input
 
         if probability < 0.5:
             result = "DEEPFAKE"
@@ -125,18 +125,12 @@ def predict():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        'status': 'running',
-        'model_loaded': model is not None
-    })
+    return jsonify({'status': 'running', 'model_loaded': model is not None})
 
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        'message': 'Deepfake Detection API is running!',
-        'endpoints': ['/predict (POST)', '/health (GET)']
-    })
+    return jsonify({'message': 'Deepfake Detection API is running!'})
 
 
 if __name__ == '__main__':
