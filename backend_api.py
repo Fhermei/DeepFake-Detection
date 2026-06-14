@@ -35,7 +35,7 @@ get_model()
 print("Ready!")
 
 
-def extract_frames(video_path, num_frames=15, target_size=(224, 224)):
+def extract_frames(video_path, num_frames=30, target_size=(224, 224)):
     """Extract fewer frames to save memory."""
     cap = cv2.VideoCapture(video_path)
     frames = []
