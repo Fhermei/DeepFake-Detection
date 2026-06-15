@@ -1,21 +1,17 @@
-"""
-DEEPFAKE DETECTION BACKEND - MEMORY OPTIMIZED
-"""
-
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import gc
 import cv2
 import numpy as np
 import tempfile
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 app = Flask(__name__)
 CORS(app)
 
-# Load model ONCE at startup
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'deepfake_detector_final.h5')
 model = None
 
@@ -29,38 +25,37 @@ def get_model():
         print("Model loaded!")
     return model
 
-# Load at startup
-print("Loading model at startup...")
+print("Loading model...")
 get_model()
 print("Ready!")
 
 
 def extract_frames(video_path, num_frames=30, target_size=(224, 224)):
-    """Extract fewer frames to save memory."""
     cap = cv2.VideoCapture(video_path)
-    frames = []
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = []
 
     if total_frames == 0:
         cap.release()
         return None
 
-    indices = np.linspace(0, total_frames - 1, min(num_frames, total_frames), dtype=int)
+    indices = np.linspace(0, max(total_frames - 1, 0), num_frames, dtype=int)
 
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
         if ret:
-            frame = cv2.resize(frame, target_size)
-            frame = (frame / 255.0).astype(np.float32)
-            frames.append(frame)
+            frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
+            frames.append((frame / 255.0).astype(np.float16))
+        else:
+            frames.append(np.zeros((target_size[0], target_size[1], 3), dtype=np.float16))
 
     cap.release()
 
     while len(frames) < num_frames:
-        frames.append(np.zeros((target_size[0], target_size[1], 3), dtype=np.float32))
+        frames.append(np.zeros((target_size[0], target_size[1], 3), dtype=np.float16))
 
-    return np.array(frames, dtype=np.float32)
+    return np.array(frames[:num_frames], dtype=np.float16)
 
 
 @app.route('/predict', methods=['POST'])
@@ -86,13 +81,15 @@ def predict():
         if frames is None:
             return jsonify({'error': 'Could not read video frames'}), 400
 
+        frames_input = np.expand_dims(frames.astype(np.float32), axis=0)
+        del frames
+        gc.collect()
+
         m = get_model()
-        frames_input = np.expand_dims(frames, axis=0)
         prediction = m.predict(frames_input, verbose=0, batch_size=1)
         probability = float(prediction[0][0])
-
-        # Free memory
-        del frames, frames_input
+        del frames_input
+        gc.collect()
 
         if probability < 0.5:
             result = "DEEPFAKE"
@@ -116,11 +113,13 @@ def predict():
         })
 
     except Exception as e:
+        gc.collect()
         return jsonify({'error': str(e)}), 500
 
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        gc.collect()
 
 
 @app.route('/health', methods=['GET'])
